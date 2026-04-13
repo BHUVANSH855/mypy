@@ -9417,4 +9417,4 @@ def f() -> NT:
 class X:
     __qualname__ = 5
 [out]
-error: "__qualname__" must be str
+main:2: error: "__qualname__" must be str

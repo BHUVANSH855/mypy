@@ -3325,7 +3325,11 @@ class SemanticAnalyzer(
             # This should be safe as generally semantic analyzer is idempotent.
             with self.allow_unbound_tvars_set():
                 s.rvalue.accept(self)
-
+        if self.is_class_scope():
+            for lvalue in s.lvalues:
+                if isinstance(lvalue, NameExpr) and lvalue.name == "__qualname__":
+                    if not isinstance(s.rvalue, StrExpr):
+                        self.fail('"__qualname__" must be str', s)
         # The r.h.s. is now ready to be classified, first check if it is a special form:
         special_form = False
         # * type alias
