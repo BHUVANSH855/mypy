@@ -3325,7 +3325,11 @@ class SemanticAnalyzer(
             # This should be safe as generally semantic analyzer is idempotent.
             with self.allow_unbound_tvars_set():
                 s.rvalue.accept(self)
-        if self.is_class_scope():
+        if (
+            self.is_class_scope()
+            and not self.is_stub_file
+            and not self.is_typeshed_stub_file
+        ):
             for lvalue in s.lvalues:
                 if isinstance(lvalue, NameExpr) and lvalue.name == "__qualname__":
                     if not isinstance(s.rvalue, StrExpr):
