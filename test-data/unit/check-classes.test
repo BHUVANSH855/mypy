@@ -9412,3 +9412,9 @@ from typ import NT
 def f() -> NT:
     return NT(x='')
 [builtins fixtures/tuple.pyi]
+
+[case test_qualname_must_be_str]
+class X:
+    __qualname__ = 5
+[out]
+error: "__qualname__" must be str
