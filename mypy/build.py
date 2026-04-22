@@ -91,6 +91,7 @@ from mypy.checker import DeferredNode, TypeChecker
 from mypy.defaults import (
     WORKER_CONNECTION_TIMEOUT,
     WORKER_DONE_TIMEOUT,
+    WORKER_SHUTDOWN_TIMEOUT,
     WORKER_START_INTERVAL,
     WORKER_START_TIMEOUT,
 )
@@ -120,7 +121,6 @@ from mypy.nodes import (
     ImportFrom,
     MypyFile,
     OverloadedFuncDef,
-    ParseError,
     SymbolTable,
 )
 from mypy.options import OPTIONS_AFFECTING_CACHE_NO_PLATFORM
@@ -167,12 +167,12 @@ from mypy.modulefinder import (
 from mypy.modules_state import modules_state
 from mypy.nodes import Expression
 from mypy.options import Options
-from mypy.parse import load_from_raw, parse, report_parse_error
+from mypy.parse import load_from_raw, parse
 from mypy.plugin import ChainedPlugin, Plugin, ReportConfigContext
 from mypy.plugins.default import DefaultPlugin
 from mypy.renaming import LimitedVariableRenameVisitor, VariableRenameVisitor
 from mypy.stats import dump_type_stats
-from mypy.stubinfo import is_module_from_legacy_bundled_package, stub_distribution_name
+from mypy.stubinfo import stub_distribution_name
 from mypy.types import Type, instance_cache
 from mypy.typestate import reset_global_state, type_state
 from mypy.util import json_dumps, json_loads
@@ -283,6 +283,7 @@ class WorkerClient:
         ]
         # Return early without waiting, caller must call connect() before using the client.
         self.proc = subprocess.Popen(command, env=env)
+        self.connected = False
 
     def connect(self) -> None:
         end_time = time.time() + WORKER_START_TIMEOUT
@@ -303,18 +304,19 @@ class WorkerClient:
                     # verify PIDs reliably.
                     assert pid == self.proc.pid, f"PID mismatch: {pid} vs {self.proc.pid}"
                 self.conn = IPCClient(connection_name, WORKER_CONNECTION_TIMEOUT)
+                self.connected = True
                 return
             except Exception as exc:
                 last_exception = exc
                 break
-        print("Failed to establish connection with worker:", last_exception)
-        sys.exit(2)
+        print(f"Failed to establish connection with worker: {last_exception}")
 
     def close(self) -> None:
-        self.conn.close()
+        if self.connected:
+            self.conn.close()
         # Technically we don't need to wait, but otherwise we will get ResourceWarnings.
         try:
-            self.proc.wait(timeout=1)
+            self.proc.wait(timeout=WORKER_SHUTDOWN_TIMEOUT)
         except subprocess.TimeoutExpired:
             pass
         if os.path.isfile(self.status_file):
@@ -346,7 +348,7 @@ def build(
 
     If a flush_errors callback is provided, all error messages will be
     passed to it and the errors and messages fields of BuildResult and
-    CompileError (respectively) will be empty. Otherwise those fields will
+    CompileError (respectively) will be empty. Otherwise, those fields will
     report any error messages.
 
     Args:
@@ -356,6 +358,9 @@ def build(
         (takes precedence over other directories)
       flush_errors: optional function to flush errors after a file is processed
       fscache: optionally a file-system cacher
+      stdout: Output stream to use instead of `sys.stdout`
+      stderr: Error stream to use instead of `sys.stderr`
+      extra_plugins: Plugins to use in addition to those loaded from config
       worker_env: An environment to start parallel build workers (used for tests)
     """
     # If we were not given a flush_errors, we use one that will populate those
@@ -376,14 +381,20 @@ def build(
     stderr = stderr or sys.stderr
     extra_plugins = extra_plugins or []
 
+    # Create metastore before workers to avoid race conditions.
+    metastore = create_metastore(options, parallel_worker=False)
     workers = []
     connect_threads = []
+    # A quasi-unique ID for this specific mypy invocation.
+    build_id = os.urandom(4).hex()
     if options.num_workers > 0:
         # TODO: switch to something more efficient than pickle (also in the daemon).
         pickled_options = pickle.dumps(options.snapshot())
         options_data = b64encode(pickled_options).decode()
         workers = [
-            WorkerClient(f".mypy_worker.{idx}.json", options_data, worker_env or os.environ)
+            WorkerClient(
+                f".mypy_worker.{build_id}.{idx}.json", options_data, worker_env or os.environ
+            )
             for idx in range(options.num_workers)
         ]
         sources_message = SourcesDataMessage(sources=sources)
@@ -394,6 +405,9 @@ def build(
         def connect(wc: WorkerClient, data: bytes) -> None:
             # Start loading sources in each worker as soon as it is up.
             wc.connect()
+            if not wc.connected:
+                # Caller should detect this and fail gracefully.
+                return
             wc.conn.write_bytes(data)
 
         # We don't wait for workers to be ready until they are actually needed.
@@ -414,6 +428,7 @@ def build(
             extra_plugins,
             workers,
             connect_threads,
+            metastore,
         )
         result.errors = messages
         return result
@@ -432,6 +447,8 @@ def build(
         for thread in connect_threads:
             thread.join()
         for worker in workers:
+            if not worker.connected:
+                continue
             try:
                 send(worker.conn, SccRequestMessage(scc_id=None, import_errors={}, mod_data={}))
             except (OSError, IPCException):
@@ -451,6 +468,7 @@ def build_inner(
     extra_plugins: Sequence[Plugin],
     workers: list[WorkerClient],
     connect_threads: list[Thread],
+    metastore: MetadataStore,
 ) -> BuildResult:
     if platform.python_implementation() == "CPython":
         # Run gc less frequently, as otherwise we can spend a large fraction of
@@ -499,6 +517,7 @@ def build_inner(
         fscache=fscache,
         stdout=stdout,
         stderr=stderr,
+        metastore=metastore,
     )
     manager.workers = workers
     if manager.verbosity() >= 2:
@@ -816,6 +835,7 @@ class BuildManager:
         stderr: TextIO,
         error_formatter: ErrorFormatter | None = None,
         parallel_worker: bool = False,
+        metastore: MetadataStore | None = None,
     ) -> None:
         self.stats: dict[str, Any] = {}  # Values are ints or floats
         # Use in cases where we need to prevent race conditions in stats reporting.
@@ -903,7 +923,9 @@ class BuildManager:
                 ]
             )
 
-        self.metastore = create_metastore(options, parallel_worker=parallel_worker)
+        if metastore is None:
+            metastore = create_metastore(options, parallel_worker=parallel_worker)
+        self.metastore = metastore
 
         # a mapping from source files to their corresponding shadow files
         # for efficient lookup
@@ -976,13 +998,18 @@ class BuildManager:
             # Call print once so that we don't get a mess in parallel mode.
             print("\n".join(lines) + "\n\n", end="")
 
-    def parse_all(self, states: list[State]) -> None:
-        """Parse multiple files in parallel (if possible) and compute dependencies."""
+    def parse_all(self, states: list[State], post_parse: bool = True) -> None:
+        """Parse multiple files in parallel (if possible) and compute dependencies.
+
+        If post_parse is False, skip the last step (used when parsing unchanged files
+        that need to be re-checked due to stale dependencies).
+        """
         if not self.options.native_parser:
             # Old parser cannot be parallelized.
             for state in states:
                 state.parse_file()
-            self.post_parse_all(states)
+            if post_parse:
+                self.post_parse_all(states)
             return
 
         sequential_states = []
@@ -996,8 +1023,14 @@ class BuildManager:
                 sequential_states.append(state)
                 continue
             parallel_states.append(state)
-        self.parse_parallel(sequential_states, parallel_states)
-        self.post_parse_all(states)
+        if len(parallel_states) > 1:
+            self.parse_parallel(sequential_states, parallel_states)
+        else:
+            # Avoid using executor when there is no parallelism.
+            for state in states:
+                state.parse_file()
+        if post_parse:
+            self.post_parse_all(states)
 
     def parse_parallel(self, sequential_states: list[State], parallel_states: list[State]) -> None:
         """Perform parallel parsing of states.
@@ -1007,7 +1040,10 @@ class BuildManager:
         parallelized efficiently.
         """
         futures = []
-        parallel_parsed_states = {}
+        # Use both list and a set to have more predictable order of errors,
+        # while also not sacrificing performance.
+        parallel_parsed_states = []
+        parallel_parsed_states_set = set()
         # Use at least --num-workers if specified by user.
         available_threads = max(get_available_threads(), self.options.num_workers)
         # Overhead from trying to parallelize (small) blocking portion of
@@ -1025,7 +1061,8 @@ class BuildManager:
                     if ignore_errors:
                         self.errors.ignored_files.add(state.xpath)
                     futures.append(executor.submit(state.parse_file_inner, state.source or ""))
-                    parallel_parsed_states[state.id] = state
+                    parallel_parsed_states.append(state)
+                    parallel_parsed_states_set.add(state)
                 else:
                     self.log(f"Using cached AST for {state.xpath} ({state.id})")
                     state.tree, state.early_errors = self.ast_cache[state.id]
@@ -1035,21 +1072,27 @@ class BuildManager:
                 state.parse_file()
 
             for fut in wait(futures).done:
-                state_id, parse_errors = fut.result()
-                # New parser reports errors lazily, add them if any.
-                if parse_errors:
-                    state = parallel_parsed_states[state_id]
-                    with state.wrap_context():
-                        self.errors.set_file(state.xpath, state.id, options=state.options)
-                        for error in parse_errors:
-                            report_parse_error(error, self.errors)
-                        if self.errors.is_blockers():
-                            self.log("Bailing due to parse errors")
-                            self.errors.raise_error()
+                fut.result()
+            for state in parallel_parsed_states:
+                # New parser returns serialized trees that need to be de-serialized.
+                with state.wrap_context():
+                    assert state.tree is not None
+                    if state.tree.raw_data:
+                        state.tree = load_from_raw(
+                            state.xpath,
+                            state.id,
+                            state.tree.raw_data,
+                            self.errors,
+                            state.options,
+                            imports_only=bool(self.workers),
+                        )
+                    if self.errors.is_blockers():
+                        self.log("Bailing due to parse errors")
+                        self.errors.raise_error()
 
         for state in parallel_states:
             assert state.tree is not None
-            if state.id in parallel_parsed_states:
+            if state in parallel_parsed_states_set:
                 state.early_errors = list(self.errors.error_info_map.get(state.xpath, []))
                 state.semantic_analysis_pass1()
                 self.ast_cache[state.id] = (state.tree, state.early_errors)
@@ -1185,31 +1228,18 @@ class BuildManager:
         source: str,
         options: Options,
         raw_data: FileRawData | None = None,
-    ) -> tuple[MypyFile, list[ParseError]]:
+    ) -> MypyFile:
         """Parse the source of a file with the given name.
 
         Raise CompileError if there is a parse error.
         """
-        imports_only = False
         file_exists = self.fscache.exists(path)
-        if self.workers and file_exists:
-            # Currently, we can use the native parser only for actual files.
-            imports_only = True
         t0 = time.time()
-        parse_errors: list[ParseError] = []
         if raw_data:
             # If possible, deserialize from known binary data instead of parsing from scratch.
             tree = load_from_raw(path, id, raw_data, self.errors, options)
         else:
-            tree, parse_errors = parse(
-                source,
-                path,
-                id,
-                self.errors,
-                options=options,
-                file_exists=file_exists,
-                imports_only=imports_only,
-            )
+            tree = parse(source, path, id, self.errors, options=options, file_exists=file_exists)
         tree._fullname = id
         if self.stats_enabled:
             with self.stats_lock:
@@ -1219,7 +1249,7 @@ class BuildManager:
                     stubs_parsed=int(tree.is_stub),
                     parse_time=time.time() - t0,
                 )
-        return tree, parse_errors
+        return tree
 
     def load_fine_grained_deps(self, id: str) -> dict[str, set[str]]:
         t0 = time.time()
@@ -1294,9 +1324,20 @@ class BuildManager:
 
     def wait_ack(self) -> None:
         """Wait for an ack from all workers."""
-        for worker in self.workers:
-            buf = receive(worker.conn)
+        for idx in range(len(self.workers)):
+            buf = self.receive_worker_message(idx)
             assert read_tag(buf) == ACK_MESSAGE
+
+    def receive_worker_message(self, idx: int) -> ReadBuffer:
+        """Receive a single message from a worker, with crash diagnostics."""
+        try:
+            return receive(self.workers[idx].conn)
+        except OSError as exc:
+            exit_code = self.workers[idx].proc.poll()
+            exit_status = f"exit code {exit_code}" if exit_code is not None else "still running"
+            raise OSError(
+                f"Worker {idx} disconnected before sending data ({exit_status})"
+            ) from exc
 
     def submit(self, graph: Graph, sccs: list[SCC]) -> None:
         """Submit a stale SCC for processing in current process or parallel workers."""
@@ -1367,7 +1408,7 @@ class BuildManager:
         ready = ready_to_read([w.conn for w in self.workers], WORKER_DONE_TIMEOUT)
         t1 = time.time()
         for idx in ready:
-            buf = receive(self.workers[idx].conn)
+            buf = self.receive_worker_message(idx)
             assert read_tag(buf) == SCC_RESPONSE_MESSAGE
             data = SccResponseMessage.read(buf)
             if not data.is_interface:
@@ -3055,15 +3096,12 @@ class State:
         self.time_spent_us += time_spent_us(t0)
         return source
 
-    def parse_file_inner(
-        self, source: str, raw_data: FileRawData | None = None
-    ) -> tuple[str, list[ParseError]]:
+    def parse_file_inner(self, source: str, raw_data: FileRawData | None = None) -> None:
         t0 = time_ref()
-        self.tree, parse_errors = self.manager.parse_file(
+        self.tree = self.manager.parse_file(
             self.id, self.xpath, source, options=self.options, raw_data=raw_data
         )
         self.time_spent_us += time_spent_us(t0)
-        return self.id, parse_errors
 
     def parse_file(self, *, temporary: bool = False, raw_data: FileRawData | None = None) -> None:
         """Parse file and run first pass of semantic analysis.
@@ -3072,7 +3110,8 @@ class State:
         modules in any way. Logic here should be kept in sync with BuildManager.parse_all().
         """
         self.needs_parse = False
-        if self.tree is not None:
+        tree = self.tree
+        if tree is not None:
             # The file was already parsed.
             return
 
@@ -3086,10 +3125,19 @@ class State:
                 self.manager.errors.ignored_files.add(self.xpath)
             with self.wrap_context():
                 manager.errors.set_file(self.xpath, self.id, options=self.options)
-                _, parse_errors = self.parse_file_inner(source, raw_data)
-                for error in parse_errors:
-                    # New parser reports errors lazily.
-                    report_parse_error(error, manager.errors)
+                self.parse_file_inner(source, raw_data)
+                assert self.tree is not None
+                # New parser returns serialized trees that need to be de-serialized.
+                if self.tree.raw_data is not None:
+                    assert raw_data is None
+                    self.tree = load_from_raw(
+                        self.xpath,
+                        self.id,
+                        self.tree.raw_data,
+                        manager.errors,
+                        self.options,
+                        imports_only=bool(self.manager.workers),
+                    )
                 if manager.errors.is_blockers():
                     manager.log("Bailing due to parse errors")
                     manager.errors.raise_error()
@@ -3258,12 +3306,19 @@ class State:
         assert len(self.type_checker()._type_maps) == 1
         return self.type_checker()._type_maps[0]
 
-    def type_check_second_pass(self, todo: Sequence[DeferredNode] | None = None) -> bool:
+    def type_check_second_pass(
+        self,
+        todo: Sequence[DeferredNode] | None = None,
+        recurse_into_functions: bool = True,
+        impl_only: bool = False,
+    ) -> bool:
         if self.options.semantic_analysis_only:
             return False
         t0 = time_ref()
         with self.wrap_context():
-            result = self.type_checker().check_second_pass(todo=todo)
+            result = self.type_checker().check_second_pass(
+                todo=todo, recurse_into_functions=recurse_into_functions, impl_only=impl_only
+            )
         self.time_spent_us += time_spent_us(t0)
         return result
 
@@ -3606,19 +3661,6 @@ def find_module_and_diagnose(
         # search path or the module has not been installed.
 
         ignore_missing_imports = options.ignore_missing_imports
-
-        # Don't honor a global (not per-module) ignore_missing_imports
-        # setting for modules that used to have bundled stubs, as
-        # otherwise updating mypy can silently result in new false
-        # negatives. (Unless there are stubs, but they are incomplete.)
-        global_ignore_missing_imports = manager.options.ignore_missing_imports
-        if (
-            is_module_from_legacy_bundled_package(id)
-            and global_ignore_missing_imports
-            and not options.ignore_missing_imports_per_module
-            and result is ModuleNotFoundReason.APPROVED_STUBS_NOT_INSTALLED
-        ):
-            ignore_missing_imports = False
 
         if skip_diagnose:
             raise ModuleNotFound
@@ -3972,6 +4014,9 @@ def dispatch(
         # Wait for workers since they may be needed at this point.
         for thread in connect_threads:
             thread.join()
+        not_connected = [str(idx) for idx, wc in enumerate(manager.workers) if not wc.connected]
+        if not_connected:
+            raise OSError(f"Cannot connect to build worker(s): {', '.join(not_connected)}")
         process_graph(graph, manager)
         # Update plugins snapshot.
         write_plugins_snapshot(manager)
@@ -4594,9 +4639,9 @@ def process_stale_scc(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
         # Re-generate import errors in case this module was loaded from the cache.
         if graph[id].meta:
             graph[id].verify_dependencies(suppressed_only=True)
-        # We may already have parsed the module, or not.
-        # If the former, parse_file() is a no-op.
-        graph[id].parse_file()
+    # We may already have parsed the modules, or not.
+    # If the former, parse_file() is a no-op.
+    manager.parse_all([graph[id] for id in stale], post_parse=False)
     if "typing" in scc:
         # For historical reasons we need to manually add typing aliases
         # for built-in generic collections, see docstring of
@@ -4707,7 +4752,7 @@ def process_stale_scc_interface(
         for id in stale:
             if id not in unfinished_modules:
                 continue
-            if not graph[id].type_check_second_pass():
+            if not graph[id].type_check_second_pass(recurse_into_functions=False):
                 unfinished_modules.discard(id)
 
     t4 = time.time()
@@ -4765,7 +4810,7 @@ def process_stale_scc_implementation(
         for _, node, info in tree.local_definitions(impl_only=True):
             assert isinstance(node.node, (FuncDef, OverloadedFuncDef, Decorator))
             todo.append(DeferredNode(node.node, info))
-        graph[id].type_check_second_pass(todo=todo)
+        graph[id].type_check_second_pass(todo=todo, impl_only=True)
         if not checker.deferred_nodes:
             unfinished_modules.discard(id)
             graph[id].detect_possibly_undefined_vars()
@@ -4774,7 +4819,7 @@ def process_stale_scc_implementation(
         for id in stale:
             if id not in unfinished_modules:
                 continue
-            if not graph[id].type_check_second_pass():
+            if not graph[id].type_check_second_pass(impl_only=True):
                 unfinished_modules.discard(id)
                 graph[id].detect_possibly_undefined_vars()
                 graph[id].finish_passes()

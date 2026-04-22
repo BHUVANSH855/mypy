@@ -46,6 +46,7 @@ from mypyc.codegen.emitwrapper import (
 )
 from mypyc.codegen.literals import Literals
 from mypyc.common import (
+    EXT_SUFFIX,
     IS_FREE_THREADED,
     MODULE_PREFIX,
     PREFIX,
@@ -56,7 +57,15 @@ from mypyc.common import (
     short_id_from_name,
 )
 from mypyc.errors import Errors
-from mypyc.ir.deps import LIBRT_BASE64, LIBRT_STRINGS, LIBRT_TIME, LIBRT_VECS, SourceDep
+from mypyc.ir.deps import (
+    LIBRT_BASE64,
+    LIBRT_STRINGS,
+    LIBRT_TIME,
+    LIBRT_VECS,
+    Capsule,
+    HeaderDep,
+    SourceDep,
+)
 from mypyc.ir.func_ir import FuncIR
 from mypyc.ir.module_ir import ModuleIR, ModuleIRs, deserialize_modules
 from mypyc.ir.ops import DeserMaps, LoadLiteral
@@ -436,24 +445,31 @@ def load_scc_from_cache(
     return modules
 
 
-def collect_source_dependencies(
-    modules: dict[str, ModuleIR], *, internal: bool = True
-) -> set[SourceDep]:
-    """Collect all SourceDep dependencies from all modules.
-
-    If internal is set to False, returns only the dependencies that can be exported to C extensions
-    dependent on the one currently being compiled.
-    """
+def collect_source_dependencies(modules: dict[str, ModuleIR]) -> set[SourceDep]:
+    """Collect all SourceDep dependencies from all modules."""
     source_deps: set[SourceDep] = set()
     for module in modules.values():
         for dep in module.dependencies:
             if isinstance(dep, SourceDep):
-                if internal == dep.internal:
+                if dep.internal:
                     source_deps.add(dep)
+            elif isinstance(dep, Capsule):
+                source_deps.add(dep.internal_dep())
+    return source_deps
+
+
+def collect_header_dependencies(modules: dict[str, ModuleIR], *, internal: bool) -> set[str]:
+    """Collect all header dependencies from all modules."""
+    header_deps: set[str] = set()
+    for module in modules.values():
+        for dep in module.dependencies:
+            if isinstance(dep, (SourceDep, HeaderDep)):
+                if dep.internal == internal:
+                    header_deps.add(dep.get_header())
             else:
                 capsule_dep = dep.internal_dep() if internal else dep.external_dep()
-                source_deps.add(capsule_dep)
-    return source_deps
+                header_deps.add(capsule_dep.get_header())
+    return header_deps
 
 
 def compile_modules_to_c(
@@ -652,9 +668,9 @@ class GroupGenerator:
             if self.compiler_options.depends_on_librt_internal:
                 decls.emit_line(f'#include "internal/librt_internal{suffix}.h"')
             # Include headers for conditional source files
-            source_deps = collect_source_dependencies(self.modules, internal=internal)
-            for source_dep in sorted(source_deps, key=lambda d: d.path):
-                decls.emit_line(f'#include "{source_dep.get_header()}"')
+            header_deps = collect_header_dependencies(self.modules, internal=internal)
+            for header_dep in sorted(header_deps):
+                decls.emit_line(f'#include "{header_dep}"')
 
         emit_dep_headers(ext_declarations, False)
 
@@ -1271,11 +1287,42 @@ class GroupGenerator:
             f"if (unlikely({module_static} == NULL))",
             "    goto fail;",
         )
+
+        emitter.emit_line(f'modname = PyUnicode_FromString("{module_name}");')
+        emitter.emit_line("if (modname == NULL) CPyError_OutOfMemory();")
+        emitter.emit_line("int rv = 0;")
+        if self.group_name:
+            shared_lib_mod_name = shared_lib_name(self.group_name)
+            emitter.emit_line("PyObject *mod_dict = PyImport_GetModuleDict();")
+            emitter.emit_line("PyObject *shared_lib = NULL;")
+            emitter.emit_line(
+                f'rv = PyDict_GetItemStringRef(mod_dict, "{shared_lib_mod_name}", &shared_lib);'
+            )
+            emitter.emit_line("if (rv < 0) goto fail;")
+            emitter.emit_line(
+                'PyObject *shared_lib_file = PyObject_GetAttrString(shared_lib, "__file__");'
+            )
+            emitter.emit_line("if (shared_lib_file == NULL) goto fail;")
+        else:
+            emitter.emit_line(
+                f'PyObject *shared_lib_file = PyUnicode_FromString("{module_name + EXT_SUFFIX}");'
+            )
+            emitter.emit_line("if (shared_lib_file == NULL) CPyError_OutOfMemory();")
+        emitter.emit_line(f'PyObject *ext_suffix = PyUnicode_FromString("{EXT_SUFFIX}");')
+        emitter.emit_line("if (ext_suffix == NULL) CPyError_OutOfMemory();")
+        is_pkg = int(self.source_paths[module_name].endswith("__init__.py"))
+        emitter.emit_line(f"Py_ssize_t is_pkg = {is_pkg};")
+
+        emitter.emit_line(
+            f"rv = CPyImport_SetDunderAttrs({module_static}, modname, shared_lib_file, ext_suffix, is_pkg);"
+        )
+        emitter.emit_line("Py_DECREF(ext_suffix);")
+        emitter.emit_line("Py_DECREF(shared_lib_file);")
+        emitter.emit_line("if (rv < 0) goto fail;")
+
         # Register in sys.modules early so that circular imports via
         # CPyImport_ImportNative can detect that this module is already
         # being initialized and avoid re-executing the module body.
-        emitter.emit_line(f'modname = PyUnicode_FromString("{module_name}");')
-        emitter.emit_line("if (modname == NULL) CPyError_OutOfMemory();")
         emitter.emit_line(
             f"if (PyObject_SetItem(PyImport_GetModuleDict(), modname, {module_static}) < 0)"
         )

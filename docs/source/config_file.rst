@@ -432,7 +432,7 @@ Platform configuration
 
     Specifies the Python version used to parse and check the target
     program.  The string should be in the format ``MAJOR.MINOR`` --
-    for example ``3.9``.  The default is the version of the Python
+    for example ``3.10``.  The default is the version of the Python
     interpreter used to run mypy.
 
     This option may only be set in the global section (``[mypy]``).
@@ -720,9 +720,9 @@ section of the command line docs.
 
     By default, mypy won't allow a variable to be redefined with an
     unrelated type. This flag enables the redefinition of unannotated
-    variables with an arbitrary type. You will also need to enable
-    :confval:`local_partial_types`.
-    Example:
+    variables with an arbitrary type. This also requires
+    :confval:`local_partial_types`, which is enabled by default starting
+    from mypy 2.0. Example:
 
     .. code-block:: python
 
@@ -761,7 +761,7 @@ section of the command line docs.
             reveal_type(values)  # Revealed type is list[float]
 
     Note: We are planning to turn this flag on by default in a future mypy
-    release, along with :confval:`local_partial_types`.
+    release.
 
 .. confval:: allow_redefinition_old
 
@@ -800,11 +800,11 @@ section of the command line docs.
 .. confval:: local_partial_types
 
     :type: boolean
-    :default: False
+    :default: True
 
-    Disallows inferring variable type for ``None`` from two assignments in different scopes.
-    This is always implicitly enabled when using the :ref:`mypy daemon <mypy_daemon>`.
-    This will be enabled by default in mypy v2.0 release.
+    This prevents inferring a variable type from an empty container (such as a list or
+    a dictionary) created at module top level or class body and updated in
+    a function. This must be enabled when using the :ref:`mypy daemon <mypy_daemon>`.
 
 .. confval:: disable_error_code
 
@@ -867,10 +867,10 @@ section of the command line docs.
 .. confval:: strict_bytes
 
    :type: boolean
-   :default: False
+   :default: True
 
-   Disable treating ``bytearray`` and ``memoryview`` as subtypes of ``bytes``.
-   This will be enabled by default in *mypy 2.0*.
+   If disabled, mypy treats ``bytearray`` and ``memoryview`` as subtypes of ``bytes``.
+   This has been enabled by default since mypy 2.0.
 
 .. confval:: strict
 
@@ -1255,7 +1255,7 @@ of your repo (or append it to the end of an existing ``pyproject.toml`` file) an
     # mypy global options:
 
     [tool.mypy]
-    python_version = "3.9"
+    python_version = "3.10"
     warn_return_any = true
     warn_unused_configs = true
     exclude = [
